@@ -1,0 +1,2 @@
+# etfmcp
+通过mcp获取指数ETF基金相关信息给agent使用提示agent决策能力
