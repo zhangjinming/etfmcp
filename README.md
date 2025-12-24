@@ -16,7 +16,7 @@
 ### 依赖安装
 
 ```bash
-pip install akshare mcp pandas numpy
+pip install akshare fastmcp pandas numpy
 ```
 
 ### 克隆项目
@@ -28,15 +28,25 @@ cd etfmcp
 
 ## 使用方法
 
-### 作为 MCP 服务运行
+### stdio 模式（默认）
 
 ```bash
 python main.py
 ```
 
+### Streamable HTTP 模式
+
+```bash
+# 默认配置 (0.0.0.0:8000/mcp)
+python main.py --http
+
+# 自定义配置
+python main.py --http --host 127.0.0.1 --port 9000
+```
+
 ### 在 Claude Desktop 中配置
 
-在 `claude_desktop_config.json` 中添加：
+**stdio 模式：**
 
 ```json
 {
@@ -44,6 +54,18 @@ python main.py
     "etf": {
       "command": "python",
       "args": ["/path/to/etfmcp/main.py"]
+    }
+  }
+}
+```
+
+**Streamable HTTP 模式：**
+
+```json
+{
+  "mcpServers": {
+    "etf": {
+      "url": "http://localhost:8000/mcp"
     }
   }
 }
