@@ -3,7 +3,7 @@ MCP 工具定义模块
 定义所有暴露给 AI Agent 的 MCP 工具
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import akshare as ak
 
@@ -21,7 +21,6 @@ from indicators import (
     calculate_boll,
     calculate_rsi,
     calculate_macd,
-    calculate_kdj,
     resample_to_weekly,
     format_indicator_summary,
     get_indicator_signals,
@@ -65,23 +64,31 @@ def register_tools(mcp):
         return output
 
     @mcp.tool()
-    def get_etf_technical_indicators(code: str, period: str = "weekly") -> str:
+    def get_etf_technical_indicators(code: str, period: str = "weekly", start_date: str = "", end_date: str = "") -> str:
         """
-        获取ETF的技术指标分析（BOLL、RSI、MACD、KDJ等）
+        获取ETF的技术指标分析（BOLL、RSI、MACD等）
         
         Args:
             code: ETF代码，如"159915"、"510300"
             period: 周期，"daily"日线或"weekly"周线，默认周线
+            start_date: 开始日期，格式YYYYMMDD或YYYY-MM-DD，如"20240101"或"2024-01-01"
+            end_date: 结束日期，格式YYYYMMDD或YYYY-MM-DD，如"20241225"或"2024-12-25"
         
         Returns:
             包含各项技术指标的详细分析报告
         """
         try:
             # 获取历史数据
-            df = get_etf_hist_data(code, days=365)
+            if start_date and end_date:
+                df = get_etf_hist_data(code, start_date=start_date, end_date=end_date)
+            else:
+                df = get_etf_hist_data(code, days=365)
             
             if df.empty:
                 return f"未能获取ETF {code} 的历史数据"
+            
+            # 保存日线数据用于计算涨跌幅
+            daily_df = df.copy()
             
             # 根据周期转换数据
             if period == "weekly":
@@ -102,32 +109,58 @@ def register_tools(mcp):
             
             # 价格信息
             latest_price = df['close'].iloc[-1]
-            week_ago_price = df['close'].iloc[-2] if len(df) > 1 else latest_price
-            month_ago_price = df['close'].iloc[-5] if len(df) > 4 else latest_price
+            
+            # 周涨跌幅：当前价格与上周收盘价对比（周线数据）
+            if len(df) > 1:
+                week_ago_price = df['close'].iloc[-2]
+                weekly_change_pct = round((latest_price - week_ago_price) / week_ago_price * 100, 2)
+            else:
+                weekly_change_pct = 0
+            
+            # 月涨跌幅：当前价格与上月最后一个交易日收盘价对比（与大智慧等软件一致）
+            monthly_change_pct = 0
+            if len(daily_df) > 0:
+                # 确保日期列是datetime类型
+                if 'date' in daily_df.columns:
+                    daily_df['date'] = pd.to_datetime(daily_df['date'])
+                    # 获取当前月份的第一天
+                    current_date = daily_df['date'].iloc[-1]
+                    first_day_of_month = current_date.replace(day=1)
+                    
+                    # 找到上月最后一个交易日的收盘价（本月1号之前的最后一个交易日）
+                    last_month_df = daily_df[daily_df['date'] < first_day_of_month]
+                    if len(last_month_df) > 0:
+                        last_month_close_price = last_month_df['close'].iloc[-1]
+                        monthly_change_pct = round((latest_price - last_month_close_price) / last_month_close_price * 100, 2)
             
             indicators['price_info'] = {
                 'latest_price': round(latest_price, 4),
-                'weekly_change_pct': round((latest_price - week_ago_price) / week_ago_price * 100, 2),
-                'monthly_change_pct': round((latest_price - month_ago_price) / month_ago_price * 100, 2)
+                'weekly_change_pct': weekly_change_pct,
+                'monthly_change_pct': monthly_change_pct
             }
             
-            # BOLL指标
-            boll = calculate_boll(df)
+            # BOLL指标 (20日/周期)
+            boll = calculate_boll(df, period=20, std_dev=2)
+            boll_upper = boll['upper'].iloc[-1]
+            boll_middle = boll['middle'].iloc[-1]
+            boll_lower = boll['lower'].iloc[-1]
+            boll_bandwidth = boll['bandwidth'].iloc[-1]
+            boll_pb = boll['percent_b'].iloc[-1]
+            
             indicators['boll'] = {
-                'upper': round(boll['upper'].iloc[-1], 4),
-                'middle': round(boll['middle'].iloc[-1], 4),
-                'lower': round(boll['lower'].iloc[-1], 4),
-                'bandwidth': round(boll['bandwidth'].iloc[-1], 2),
-                'percent_b': round(boll['percent_b'].iloc[-1], 2)
+                'upper': round(boll_upper, 4),
+                'middle': round(boll_middle, 4),
+                'lower': round(boll_lower, 4),
+                'bandwidth': round(boll_bandwidth, 2),
+                'percent_b': round(boll_pb, 2)
             }
             
             # 判断BOLL信号
-            pb = indicators['boll']['percent_b']
-            if pb < 20:
+            if boll_pb < 20:
                 indicators['boll']['signal'] = '接近下轨，可能超卖'
-            elif pb > 80:
+            elif boll_pb > 80:
                 indicators['boll']['signal'] = '接近上轨，可能超买'
-            elif pb < 50:
+            elif boll_pb < 50:
                 indicators['boll']['signal'] = '价格偏弱，在中轨下方'
             else:
                 indicators['boll']['signal'] = '价格偏强，在中轨上方'
@@ -152,59 +185,58 @@ def register_tools(mcp):
             else:
                 indicators['rsi']['signal'] = '偏强势'
             
-            # MACD指标
-            macd = calculate_macd(df['close'])
+            # MACD指标 (12, 26, 9)
+            macd = calculate_macd(df['close'], fast=12, slow=26, signal=9)
+            dif = macd['dif'].iloc[-1]
+            dea = macd['dea'].iloc[-1]
+            macd_hist = macd['macd'].iloc[-1]
+            
+            # 检查MACD是否金叉/死叉（最近2个周期）
+            prev_dif = macd['dif'].iloc[-2] if len(df) > 1 else dif
+            prev_dea = macd['dea'].iloc[-2] if len(df) > 1 else dea
+            
             indicators['macd'] = {
-                'dif': round(macd['dif'].iloc[-1], 4),
-                'dea': round(macd['dea'].iloc[-1], 4),
-                'macd': round(macd['macd'].iloc[-1], 4)
+                'dif': round(dif, 4),
+                'dea': round(dea, 4),
+                'macd': round(macd_hist, 4)
             }
             
-            dif = indicators['macd']['dif']
-            dea = indicators['macd']['dea']
-            if dif > dea and dif > 0:
+            # MACD信号判断
+            if dif > dea and prev_dif <= prev_dea:
+                indicators['macd']['signal'] = '刚形成金叉，短期看涨'
+            elif dif < dea and prev_dif >= prev_dea:
+                indicators['macd']['signal'] = '刚形成死叉，短期看跌'
+            elif dif > dea and dif > 0:
                 indicators['macd']['signal'] = '多头强势，DIF在零轴上方'
             elif dif < dea and dif < 0:
                 indicators['macd']['signal'] = '空头强势，DIF在零轴下方'
             elif dif > dea:
-                indicators['macd']['signal'] = '金叉形成，短期看涨'
+                indicators['macd']['signal'] = '金叉状态，短期偏多'
             else:
-                indicators['macd']['signal'] = '死叉形成，短期看跌'
-            
-            # KDJ指标
-            kdj = calculate_kdj(df)
-            indicators['kdj'] = {
-                'k': round(kdj['k'].iloc[-1], 2),
-                'd': round(kdj['d'].iloc[-1], 2),
-                'j': round(kdj['j'].iloc[-1], 2)
-            }
-            
-            k = indicators['kdj']['k']
-            d = indicators['kdj']['d']
-            if k < 20 and d < 20:
-                indicators['kdj']['signal'] = '超卖区域'
-            elif k > 80 and d > 80:
-                indicators['kdj']['signal'] = '超买区域'
-            elif k > d:
-                indicators['kdj']['signal'] = 'K上穿D，短期看涨'
-            else:
-                indicators['kdj']['signal'] = 'K下穿D，短期看跌'
+                indicators['macd']['signal'] = '死叉状态，短期偏空'
             
             # 均线系统
+            ma5 = calculate_ma(df['close'], 5).iloc[-1]
+            ma10 = calculate_ma(df['close'], 10).iloc[-1]
+            ma20 = calculate_ma(df['close'], 20).iloc[-1]
+            ma60 = calculate_ma(df['close'], min(60, len(df)-1)).iloc[-1] if len(df) > 60 else None
+            
             indicators['ma'] = {
-                'ma5': round(calculate_ma(df['close'], 5).iloc[-1], 4),
-                'ma10': round(calculate_ma(df['close'], 10).iloc[-1], 4),
-                'ma20': round(calculate_ma(df['close'], 20).iloc[-1], 4),
-                'ma60': round(calculate_ma(df['close'], min(60, len(df)-1)).iloc[-1], 4) if len(df) > 60 else None
+                'ma5': round(ma5, 4),
+                'ma10': round(ma10, 4),
+                'ma20': round(ma20, 4),
+                'ma60': round(ma60, 4) if ma60 else None
             }
             
-            ma5 = indicators['ma']['ma5']
-            ma10 = indicators['ma']['ma10']
-            ma20 = indicators['ma']['ma20']
+            # 均线趋势判断
             if latest_price > ma5 > ma10 > ma20:
                 indicators['ma']['trend'] = '多头排列，上升趋势'
             elif latest_price < ma5 < ma10 < ma20:
                 indicators['ma']['trend'] = '空头排列，下降趋势'
+            elif latest_price > ma5 and latest_price > ma10:
+                indicators['ma']['trend'] = '短期偏多'
+            elif latest_price < ma5 and latest_price < ma10:
+                indicators['ma']['trend'] = '短期偏空'
             else:
                 indicators['ma']['trend'] = '均线交织，震荡整理'
             
@@ -217,13 +249,208 @@ def register_tools(mcp):
                 'volume_ratio': round(current_vol / vol_ma5, 2) if vol_ma5 > 0 else 1
             }
             
+            # ========== 综合趋势评分系统（百分制：0-100分）==========
+            # 评分维度：均线(30分) + MACD(25分) + RSI(20分) + BOLL(15分) + 动量(10分)
+            # 50分为中性，>50偏多，<50偏空
+            
+            trend_score = 50  # 基准分
+            score_details = []
+            
+            # 1. 均线趋势评分（最高±15分，共30分权重）
+            if latest_price > ma5 > ma10 > ma20:
+                # 完美多头排列
+                trend_score += 15
+                score_details.append("均线多头排列(+15)")
+            elif latest_price < ma5 < ma10 < ma20:
+                # 完美空头排列
+                trend_score -= 15
+                score_details.append("均线空头排列(-15)")
+            elif latest_price > ma5 and ma5 > ma10:
+                # 短中期多头
+                trend_score += 10
+                score_details.append("短中期均线多头(+10)")
+            elif latest_price < ma5 and ma5 < ma10:
+                # 短中期空头
+                trend_score -= 10
+                score_details.append("短中期均线空头(-10)")
+            elif latest_price > ma5:
+                # 站上5日均线
+                trend_score += 5
+                score_details.append("价格在MA5上方(+5)")
+            elif latest_price < ma5:
+                # 跌破5日均线
+                trend_score -= 5
+                score_details.append("价格在MA5下方(-5)")
+            
+            # 2. MACD评分（最高±12.5分，共25分权重）
+            if dif > dea and dif > 0:
+                # 零轴上方金叉，强势
+                trend_score += 12.5
+                score_details.append("MACD零轴上金叉(+12.5)")
+            elif dif > dea and dif < 0:
+                # 零轴下方金叉，转强
+                trend_score += 7.5
+                score_details.append("MACD零轴下金叉(+7.5)")
+            elif dif < dea and dif > 0:
+                # 零轴上方死叉，转弱
+                trend_score -= 7.5
+                score_details.append("MACD零轴上死叉(-7.5)")
+            elif dif < dea and dif < 0:
+                # 零轴下方死叉，弱势
+                trend_score -= 12.5
+                score_details.append("MACD零轴下死叉(-12.5)")
+            
+            # 3. RSI评分（最高±10分，共20分权重）
+            if rsi_14 >= 70:
+                # 超买区，可能回调
+                trend_score += 5  # 虽然超买但说明强势
+                score_details.append(f"RSI超买{rsi_14:.1f}(+5)")
+            elif rsi_14 >= 60:
+                trend_score += 8
+                score_details.append(f"RSI偏强{rsi_14:.1f}(+8)")
+            elif rsi_14 >= 50:
+                trend_score += 3
+                score_details.append(f"RSI中性偏强{rsi_14:.1f}(+3)")
+            elif rsi_14 >= 40:
+                trend_score -= 3
+                score_details.append(f"RSI中性偏弱{rsi_14:.1f}(-3)")
+            elif rsi_14 >= 30:
+                trend_score -= 8
+                score_details.append(f"RSI偏弱{rsi_14:.1f}(-8)")
+            else:
+                # 超卖区
+                trend_score -= 5  # 虽然超卖但可能反弹
+                score_details.append(f"RSI超卖{rsi_14:.1f}(-5)")
+            
+            # 4. BOLL位置评分（最高±7.5分，共15分权重）
+            if boll_pb >= 80:
+                trend_score += 4  # 接近上轨，强势但注意回调
+                score_details.append(f"BOLL接近上轨{boll_pb:.1f}%(+4)")
+            elif boll_pb >= 60:
+                trend_score += 6
+                score_details.append(f"BOLL中上区域{boll_pb:.1f}%(+6)")
+            elif boll_pb >= 40:
+                trend_score += 0  # 中间区域，中性
+                score_details.append(f"BOLL中间区域{boll_pb:.1f}%(0)")
+            elif boll_pb >= 20:
+                trend_score -= 6
+                score_details.append(f"BOLL中下区域{boll_pb:.1f}%(-6)")
+            else:
+                trend_score -= 4  # 接近下轨，弱势但可能反弹
+                score_details.append(f"BOLL接近下轨{boll_pb:.1f}%(-4)")
+            
+            # 5. 价格动量评分（最高±5分，共10分权重）
+            if monthly_change_pct >= 10:
+                trend_score += 5
+                score_details.append(f"月涨幅{monthly_change_pct}%(+5)")
+            elif monthly_change_pct >= 5:
+                trend_score += 3
+                score_details.append(f"月涨幅{monthly_change_pct}%(+3)")
+            elif monthly_change_pct >= 0:
+                trend_score += 1
+                score_details.append(f"月涨幅{monthly_change_pct}%(+1)")
+            elif monthly_change_pct >= -5:
+                trend_score -= 1
+                score_details.append(f"月跌幅{monthly_change_pct}%(-1)")
+            elif monthly_change_pct >= -10:
+                trend_score -= 3
+                score_details.append(f"月跌幅{monthly_change_pct}%(-3)")
+            else:
+                trend_score -= 5
+                score_details.append(f"月跌幅{monthly_change_pct}%(-5)")
+            
+            # 限制评分范围在0-100之间
+            trend_score = max(0, min(100, trend_score))
+            
+            # 判断趋势类型（基于百分制评分）
+            if trend_score >= 75:
+                trend_type = "强势上涨"
+                trend_desc = "多项指标共振向上，可持有或逢低加仓"
+            elif trend_score >= 60:
+                trend_type = "偏多震荡"
+                trend_desc = "整体偏多但有波动，可轻仓参与"
+            elif trend_score >= 45:
+                trend_type = "横盘整理"
+                trend_desc = "方向不明确，建议观望等待突破"
+            elif trend_score >= 30:
+                trend_type = "偏空震荡"
+                trend_desc = "整体偏空，谨慎操作，控制仓位"
+            else:
+                trend_type = "弱势下跌"
+                trend_desc = "多项指标显示弱势，建议观望或减仓"
+            
+            indicators['trend'] = {
+                'type': trend_type,
+                'score': round(trend_score, 1),
+                'description': trend_desc,
+                'details': score_details
+            }
+            
             # 生成信号汇总
             signals = get_indicator_signals(indicators)
             
             # 格式化输出
             period_name = "周线" if period == "weekly" else "日线"
-            output = format_indicator_summary(indicators, f"{etf_name}({code}) {period_name}")
             
+            output = f"=== {etf_name}({code}) {period_name}技术指标分析 ===\n\n"
+            
+            # 价格信息
+            output += f"【价格信息】\n"
+            output += f"  最新价: {indicators['price_info']['latest_price']}\n"
+            output += f"  周涨跌幅: {indicators['price_info']['weekly_change_pct']}%\n"
+            output += f"  月涨跌幅: {indicators['price_info']['monthly_change_pct']}%\n\n"
+            
+            # BOLL
+            output += f"【布林带 BOLL(20,2)】\n"
+            output += f"  上轨: {indicators['boll']['upper']}\n"
+            output += f"  中轨: {indicators['boll']['middle']}\n"
+            output += f"  下轨: {indicators['boll']['lower']}\n"
+            output += f"  带宽: {indicators['boll']['bandwidth']}%\n"
+            output += f"  %B: {indicators['boll']['percent_b']}%\n"
+            output += f"  信号: {indicators['boll']['signal']}\n\n"
+            
+            # RSI
+            output += f"【RSI 相对强弱】\n"
+            output += f"  RSI(6): {indicators['rsi']['rsi_6']}\n"
+            output += f"  RSI(12): {indicators['rsi']['rsi_12']}\n"
+            output += f"  RSI(14): {indicators['rsi']['rsi_14']}\n"
+            output += f"  信号: {indicators['rsi']['signal']}\n\n"
+            
+            # MACD
+            output += f"【MACD(12,26,9)】\n"
+            output += f"  DIF: {indicators['macd']['dif']}\n"
+            output += f"  DEA: {indicators['macd']['dea']}\n"
+            output += f"  MACD柱: {indicators['macd']['macd']}\n"
+            output += f"  信号: {indicators['macd']['signal']}\n\n"
+            
+            # 均线
+            output += f"【均线系统】\n"
+            output += f"  MA5: {indicators['ma']['ma5']}\n"
+            output += f"  MA10: {indicators['ma']['ma10']}\n"
+            output += f"  MA20: {indicators['ma']['ma20']}\n"
+            if indicators['ma']['ma60']:
+                output += f"  MA60: {indicators['ma']['ma60']}\n"
+            output += f"  趋势: {indicators['ma']['trend']}\n\n"
+            
+            # 成交量
+            output += f"【成交量分析】\n"
+            output += f"  当前成交量: {indicators['volume']['current']}\n"
+            output += f"  5日均量: {indicators['volume']['ma5']}\n"
+            output += f"  量比: {indicators['volume']['volume_ratio']}\n\n"
+            
+            # 趋势判断
+            output += "=" * 40 + "\n"
+            output += f"【综合趋势评分】(百分制，50分为中性)\n"
+            output += "=" * 40 + "\n"
+            output += f"  趋势类型: {indicators['trend']['type']}\n"
+            output += f"  综合评分: {indicators['trend']['score']}分\n"
+            output += f"  操作建议: {indicators['trend']['description']}\n\n"
+            output += "  评分明细:\n"
+            for detail in indicators['trend']['details']:
+                output += f"    • {detail}\n"
+            output += "=" * 40 + "\n\n"
+            
+            # 信号汇总
             output += "=== 信号汇总 ===\n\n"
             
             if signals['bullish']:
@@ -334,27 +561,39 @@ def register_tools(mcp):
             return f"获取指数行情失败: {str(e)}"
 
     @mcp.tool()
-    def get_index_history(symbol: str, days: int = 60) -> str:
+    def get_index_history(symbol: str, days: int = 60, start_date: str = "", end_date: str = "") -> str:
         """
         获取指数历史数据
         
         Args:
             symbol: 指数代码，如"sh000001"(上证指数)、"sz399001"(深证成指)
-            days: 获取最近多少天的数据，默认60天
+            days: 获取最近多少天的数据，默认60天（当start_date和end_date为空时使用）
+            start_date: 开始日期，格式YYYYMMDD或YYYY-MM-DD，如"20240101"或"2024-01-01"
+            end_date: 结束日期，格式YYYYMMDD或YYYY-MM-DD，如"20241225"或"2024-12-25"
         
         Returns:
             指数历史行情数据摘要
         """
         try:
-            df = get_index_hist_data(symbol, days)
+            if start_date and end_date:
+                df = get_index_hist_data(symbol, start_date=start_date, end_date=end_date)
+            else:
+                df = get_index_hist_data(symbol, days)
             
             if df.empty:
                 return f"未找到指数 {symbol} 的历史数据"
             
-            # 取最近N天
-            df = df.tail(days)
+            # 如果没有指定时间范围，取最近N天
+            if not (start_date and end_date):
+                df = df.tail(days)
             
-            output = f"=== {symbol} 最近{days}天历史数据 ===\n\n"
+            # 确定时间范围描述
+            if start_date and end_date:
+                period_desc = f"{start_date} 至 {end_date}"
+            else:
+                period_desc = f"最近{days}天"
+            
+            output = f"=== {symbol} {period_desc}历史数据 ===\n\n"
             
             # 统计信息
             latest = df.iloc[-1]
@@ -471,12 +710,14 @@ def register_tools(mcp):
             return f"获取经济日历失败: {str(e)}"
 
     @mcp.tool()
-    def get_etf_comprehensive_analysis(name: str) -> str:
+    def get_etf_comprehensive_analysis(name: str, start_date: str = "", end_date: str = "") -> str:
         """
         根据ETF名称获取综合分析报告，包含技术指标、实时行情和相关宏观数据
         
         Args:
             name: ETF名称关键词，如"沪深300"、"纳斯达克"、"黄金"、"医药"等
+            start_date: 开始日期，格式YYYYMMDD或YYYY-MM-DD，如"20240101"或"2024-01-01"
+            end_date: 结束日期，格式YYYYMMDD或YYYY-MM-DD，如"20241225"或"2024-12-25"
         
         Returns:
             综合分析报告，整合多项指标供大模型判断
@@ -496,6 +737,8 @@ def register_tools(mcp):
             output = f"{'='*50}\n"
             output += f"  {etf_name}({code}) 综合分析报告\n"
             output += f"  生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            if start_date and end_date:
+                output += f"  分析区间: {start_date} 至 {end_date}\n"
             output += f"{'='*50}\n\n"
             
             # 2. 实时行情
@@ -515,7 +758,10 @@ def register_tools(mcp):
             
             # 3. 周线技术指标
             try:
-                df = get_etf_hist_data(code, days=365)
+                if start_date and end_date:
+                    df = get_etf_hist_data(code, start_date=start_date, end_date=end_date)
+                else:
+                    df = get_etf_hist_data(code, days=365)
                 weekly_df = resample_to_weekly(df)
                 
                 if len(weekly_df) >= 30:
@@ -551,13 +797,6 @@ def register_tools(mcp):
                         output += "(金叉/多头)\n"
                     else:
                         output += "(死叉/空头)\n"
-                    
-                    # KDJ
-                    kdj = calculate_kdj(weekly_df)
-                    k = round(kdj['k'].iloc[-1], 2)
-                    d = round(kdj['d'].iloc[-1], 2)
-                    j = round(kdj['j'].iloc[-1], 2)
-                    output += f"  KDJ K:{k} D:{d} J:{j}\n"
                     
                     # 均线
                     ma5 = round(calculate_ma(weekly_df['close'], 5).iloc[-1], 4)
@@ -890,19 +1129,24 @@ def register_tools(mcp):
             return f"获取排行榜失败: {str(e)}"
 
     @mcp.tool()
-    def analyze_etf_trend(code: str) -> str:
+    def analyze_etf_trend(code: str, start_date: str = "", end_date: str = "") -> str:
         """
         分析ETF的趋势状态，包含当前指标、近半年和近一年的技术指标历史统计和综合评分
         
         Args:
             code: ETF代码，如"510300"
+            start_date: 开始日期，格式YYYYMMDD或YYYY-MM-DD，如"20240101"或"2024-01-01"
+            end_date: 结束日期，格式YYYYMMDD或YYYY-MM-DD，如"20241225"或"2024-12-25"
         
         Returns:
             趋势分析报告，包含多周期技术指标统计、趋势判断和综合评分
         """
         try:
             # 获取历史数据（2年日线数据）
-            df = get_etf_hist_data(code, days=730)
+            if start_date and end_date:
+                df = get_etf_hist_data(code, start_date=start_date, end_date=end_date)
+            else:
+                df = get_etf_hist_data(code, days=730)
             
             if df.empty or len(df) < 60:
                 return f"数据量不足，无法分析趋势"
@@ -967,6 +1211,8 @@ def register_tools(mcp):
             output = f"{'='*60}\n"
             output += f"  {etf_name}({code}) 多周期技术指标分析报告\n"
             output += f"  分析时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            if start_date and end_date:
+                output += f"  分析区间: {start_date} 至 {end_date}\n"
             output += f"{'='*60}\n\n"
             
             output += f"【当前价格】{latest_price:.4f}\n\n"
@@ -1138,6 +1384,63 @@ def register_tools(mcp):
             return f"批量查询失败: {str(e)}"
 
     @mcp.tool()
+    def get_etf_history(code: str, days: int = 60, start_date: str = "", end_date: str = "") -> str:
+        """
+        获取ETF历史行情数据
+        
+        Args:
+            code: ETF代码，如"510300"、"159915"
+            days: 获取最近多少天的数据，默认60天（当start_date和end_date为空时使用）
+            start_date: 开始日期，格式YYYYMMDD或YYYY-MM-DD，如"20240101"或"2024-01-01"
+            end_date: 结束日期，格式YYYYMMDD或YYYY-MM-DD，如"20241225"或"2024-12-25"
+        
+        Returns:
+            ETF历史行情数据摘要
+        """
+        try:
+            # 获取ETF名称
+            try:
+                etf_info = get_cached_etf_spot()
+                name_row = etf_info[etf_info['代码'] == code]
+                etf_name = name_row['名称'].values[0] if not name_row.empty else code
+            except:
+                etf_name = code
+            
+            # 获取历史数据
+            if start_date and end_date:
+                df = get_etf_hist_data(code, start_date=start_date, end_date=end_date)
+                period_desc = f"{start_date} 至 {end_date}"
+            else:
+                df = get_etf_hist_data(code, days=days)
+                period_desc = f"最近{days}天"
+            
+            if df.empty:
+                return f"未找到ETF {code} 的历史数据"
+            
+            output = f"=== {etf_name}({code}) {period_desc}历史数据 ===\n\n"
+            
+            # 统计信息
+            latest = df.iloc[-1]
+            first = df.iloc[0]
+            
+            output += f"数据条数: {len(df)}条\n"
+            output += f"起始日期: {df['date'].iloc[0].strftime('%Y-%m-%d')}\n"
+            output += f"结束日期: {df['date'].iloc[-1].strftime('%Y-%m-%d')}\n"
+            output += f"期间涨跌幅: {round((latest['close'] - first['close']) / first['close'] * 100, 2)}%\n"
+            output += f"最高价: {df['high'].max():.4f} (日期: {df.loc[df['high'].idxmax(), 'date'].strftime('%Y-%m-%d')})\n"
+            output += f"最低价: {df['low'].min():.4f} (日期: {df.loc[df['low'].idxmin(), 'date'].strftime('%Y-%m-%d')})\n"
+            output += f"平均成交量: {int(df['volume'].mean())}\n\n"
+            
+            output += "最近5个交易日:\n"
+            for _, row in df.tail(5).iterrows():
+                output += f"  {row['date'].strftime('%Y-%m-%d')}: 开{row['open']:.4f} 高{row['high']:.4f} 低{row['low']:.4f} 收{row['close']:.4f}\n"
+            
+            return output
+            
+        except Exception as e:
+            return f"获取ETF历史数据失败: {str(e)}"
+
+    @mcp.tool()
     def clear_data_cache() -> str:
         """
         清除数据缓存，强制下次请求重新获取最新数据
@@ -1166,3 +1469,136 @@ def register_tools(mcp):
         for k, v in CACHE_TTL.items():
             output += f"  {k}: {v}秒\n"
         return output
+
+    @mcp.tool()
+    def get_csv_data_info() -> str:
+        """
+        获取本地CSV数据文件信息
+        
+        Returns:
+            CSV数据文件列表及统计信息
+        """
+        from data import DATA_DIR
+        
+        output = "=== 本地CSV数据文件 ===\n\n"
+        output += f"数据目录: {DATA_DIR}\n\n"
+        
+        csv_files = list(DATA_DIR.glob("*.csv"))
+        
+        if not csv_files:
+            output += "暂无本地数据文件\n"
+            return output
+        
+        output += f"共 {len(csv_files)} 个数据文件:\n\n"
+        
+        for csv_file in sorted(csv_files):
+            try:
+                df = pd.read_csv(csv_file)
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    min_date = df['date'].min().strftime('%Y-%m-%d')
+                    max_date = df['date'].max().strftime('%Y-%m-%d')
+                    output += f"  {csv_file.name}:\n"
+                    output += f"    数据条数: {len(df)}\n"
+                    output += f"    时间范围: {min_date} ~ {max_date}\n"
+                else:
+                    output += f"  {csv_file.name}: {len(df)} 条数据\n"
+            except Exception as e:
+                output += f"  {csv_file.name}: 读取失败 ({e})\n"
+        
+        return output
+
+    @mcp.tool()
+    def clear_csv_data(code: str = "") -> str:
+        """
+        清除本地CSV数据文件
+        
+        Args:
+            code: 指定要清除的ETF/指数代码，为空则清除所有数据文件
+        
+        Returns:
+            清除结果
+        """
+        from data import DATA_DIR
+        
+        if code:
+            # 清除指定代码的数据
+            deleted = []
+            for pattern in [f"etf_{code}.csv", f"index_{code}.csv"]:
+                csv_path = DATA_DIR / pattern
+                if csv_path.exists():
+                    csv_path.unlink()
+                    deleted.append(pattern)
+            
+            if deleted:
+                return f"已删除数据文件: {', '.join(deleted)}"
+            else:
+                return f"未找到代码 {code} 的数据文件"
+        else:
+            # 清除所有数据
+            csv_files = list(DATA_DIR.glob("*.csv"))
+            count = len(csv_files)
+            
+            for csv_file in csv_files:
+                csv_file.unlink()
+            
+            return f"已清除 {count} 个CSV数据文件"
+
+    @mcp.tool()
+    def download_etf_data(code: str, start_date: str = "", end_date: str = "") -> str:
+        """
+        下载ETF历史数据到本地CSV文件
+        
+        Args:
+            code: ETF代码，如"510300"
+            start_date: 开始日期，格式YYYYMMDD或YYYY-MM-DD，默认为2年前
+            end_date: 结束日期，格式YYYYMMDD或YYYY-MM-DD，默认为今天
+        
+        Returns:
+            下载结果
+        """
+        try:
+            if not start_date:
+                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y%m%d')
+            if not end_date:
+                end_date = datetime.now().strftime('%Y%m%d')
+            
+            # 调用数据获取函数，会自动保存到CSV
+            df = get_etf_hist_data(code, start_date=start_date, end_date=end_date)
+            
+            if df.empty:
+                return f"未能获取ETF {code} 的数据"
+            
+            from data import DATA_DIR, _get_csv_path
+            csv_path = _get_csv_path('etf', code)
+            
+            return f"ETF {code} 数据下载完成:\n  数据条数: {len(df)}\n  时间范围: {df['date'].min().strftime('%Y-%m-%d')} ~ {df['date'].max().strftime('%Y-%m-%d')}\n  保存路径: {csv_path}"
+            
+        except Exception as e:
+            return f"下载ETF数据失败: {str(e)}"
+
+    @mcp.tool()
+    def download_index_data(symbol: str) -> str:
+        """
+        下载指数历史数据到本地CSV文件
+        
+        Args:
+            symbol: 指数代码，如"sh000001"(上证指数)
+        
+        Returns:
+            下载结果
+        """
+        try:
+            # 调用数据获取函数，会自动保存到CSV
+            df = get_index_hist_data(symbol, days=730)
+            
+            if df.empty:
+                return f"未能获取指数 {symbol} 的数据"
+            
+            from data import DATA_DIR, _get_csv_path
+            csv_path = _get_csv_path('index', symbol)
+            
+            return f"指数 {symbol} 数据下载完成:\n  数据条数: {len(df)}\n  时间范围: {df['date'].min().strftime('%Y-%m-%d')} ~ {df['date'].max().strftime('%Y-%m-%d')}\n  保存路径: {csv_path}"
+            
+        except Exception as e:
+            return f"下载指数数据失败: {str(e)}"

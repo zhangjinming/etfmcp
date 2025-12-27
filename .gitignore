@@ -52,5 +52,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Project specific
+# Project 
+start.sh
 CODEBUDDY.md
+.codebuddy
+
+# Data cache (CSV files)
+data/*.csv

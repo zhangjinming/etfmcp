@@ -35,12 +35,26 @@ def calculate_boll(data: pd.DataFrame, period: int = 20, std_dev: int = 2) -> di
 
 
 def calculate_rsi(data: pd.Series, period: int = 14) -> pd.Series:
-    """计算RSI相对强弱指标"""
+    """
+    计算RSI相对强弱指标（使用Wilder平滑方法，与主流交易软件一致）
+    
+    Wilder平滑法：使用 EMA(alpha=1/period) 而非 SMA
+    这与同花顺、通达信等软件的计算方式一致
+    """
     delta = data.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    # 使用 Wilder 平滑（等价于 EMA，alpha = 1/period）
+    # ewm(alpha=1/period) 等价于 ewm(span=2*period-1, adjust=False) 的近似
+    # 但更准确的 Wilder 方法是 ewm(com=period-1, adjust=False)
+    avg_gain = gain.ewm(com=period-1, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(com=period-1, min_periods=period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
 
 
 def calculate_macd(data: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
@@ -155,14 +169,6 @@ def format_indicator_summary(indicators: dict, name: str) -> str:
         summary += f"  MACD柱: {macd.get('macd', 'N/A')}\n"
         summary += f"  信号: {macd.get('signal', 'N/A')}\n\n"
     
-    if 'kdj' in indicators:
-        kdj = indicators['kdj']
-        summary += f"【KDJ 随机指标】\n"
-        summary += f"  K: {kdj.get('k', 'N/A')}\n"
-        summary += f"  D: {kdj.get('d', 'N/A')}\n"
-        summary += f"  J: {kdj.get('j', 'N/A')}\n"
-        summary += f"  信号: {kdj.get('signal', 'N/A')}\n\n"
-    
     if 'ma' in indicators:
         ma = indicators['ma']
         summary += f"【均线系统】\n"
@@ -230,20 +236,16 @@ def get_indicator_signals(indicators: dict) -> dict:
             else:
                 signals['bearish'].append('MACD: 死叉形成，看跌信号')
     
-    # KDJ信号
-    if 'kdj' in indicators:
-        kdj = indicators['kdj']
-        k = kdj.get('k', 50)
-        d = kdj.get('d', 50)
-        if k is not None and d is not None:
-            if k < 20 and d < 20:
-                signals['bullish'].append('KDJ: 超卖区域，可能反弹')
-            elif k > 80 and d > 80:
-                signals['bearish'].append('KDJ: 超买区域，可能回调')
-            elif k > d:
-                signals['bullish'].append('KDJ: K线在D线上方，短期看涨')
-            else:
-                signals['bearish'].append('KDJ: K线在D线下方，短期看跌')
+    # 均线趋势信号
+    if 'ma' in indicators:
+        ma = indicators['ma']
+        trend = ma.get('trend', '')
+        if '多头' in trend or '上升' in trend:
+            signals['bullish'].append(f'均线: {trend}')
+        elif '空头' in trend or '下降' in trend:
+            signals['bearish'].append(f'均线: {trend}')
+        else:
+            signals['neutral'].append(f'均线: {trend}')
     
     # 综合判断
     bull_count = len(signals['bullish'])
