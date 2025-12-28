@@ -21,12 +21,18 @@ from indicators import (
     calculate_boll,
     calculate_rsi,
     calculate_macd,
+    calculate_kdj,
     resample_to_weekly,
     format_indicator_summary,
     get_indicator_signals,
     calculate_period_score,
     analyze_historical_indicators,
-    get_period_trend_judgment
+    get_period_trend_judgment,
+    analyze_weekly_trend,
+    analyze_daily_buy_signals,
+    analyze_daily_sell_signals,
+    detect_macd_divergence,
+    find_support_resistance
 )
 from data import (
     search_etf_by_name,
@@ -1602,3 +1608,653 @@ def register_tools(mcp):
             
         except Exception as e:
             return f"下载指数数据失败: {str(e)}"
+
+    # ========== 波段交易策略工具 ==========
+
+    @mcp.tool()
+    def get_swing_trade_analysis(name: str) -> str:
+        """
+        波段交易综合分析（核心工具）
+        基于"周线定方向，日线找买卖点"的策略框架
+        
+        策略说明：
+        1. 周线判断中期趋势（1-6个月），使用MA20/MA60判断多空
+        2. 日线寻找具体买卖点，使用MACD背离、KDJ超卖金叉等信号
+        3. 只在周线多头趋势中寻找日线回调买入机会
+        
+        Args:
+            name: ETF名称关键词，如"沪深300"、"创业板"、"纳斯达克"等
+        
+        Returns:
+            完整的波段交易分析报告，包含趋势判断和买卖信号
+        """
+        try:
+            # 1. 搜索ETF
+            etf_list = search_etf_by_name(name)
+            if not etf_list or 'error' in etf_list[0]:
+                return f"未找到包含'{name}'的ETF"
+            
+            etf = etf_list[0]
+            code = etf['code']
+            etf_name = etf['name']
+            
+            # 2. 获取数据
+            daily_df = get_etf_hist_data(code, days=500)
+            if daily_df.empty or len(daily_df) < 120:
+                return f"数据不足，无法进行波段分析"
+            
+            weekly_df = resample_to_weekly(daily_df)
+            if len(weekly_df) < 60:
+                return f"周线数据不足60周，无法进行完整趋势分析"
+            
+            latest_price = daily_df['close'].iloc[-1]
+            
+            # 3. 周线趋势分析
+            weekly_trend = analyze_weekly_trend(weekly_df)
+            
+            # 4. 寻找支撑阻力位
+            sr_levels = find_support_resistance(weekly_df, 52)
+            
+            # 5. 日线买入信号分析
+            buy_signals = analyze_daily_buy_signals(
+                daily_df, 
+                weekly_support=sr_levels['nearest_support'],
+                weekly_ma20=weekly_trend['ma20']
+            )
+            
+            # 6. 日线卖出信号分析
+            sell_signals = analyze_daily_sell_signals(
+                daily_df,
+                weekly_resistance=sr_levels['nearest_resistance']
+            )
+            
+            # ========== 生成报告 ==========
+            output = f"{'='*60}\n"
+            output += f"  {etf_name}({code}) 波段交易分析报告\n"
+            output += f"  分析时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            output += f"  当前价格: {latest_price:.4f}\n"
+            output += f"{'='*60}\n\n"
+            
+            # 周线趋势
+            output += "【第一步：周线趋势判断】\n"
+            output += "-" * 40 + "\n"
+            output += f"  趋势类型: {weekly_trend['trend_type']}\n"
+            output += f"  趋势强度: {weekly_trend['trend_strength']}分 (-100空头 ~ +100多头)\n"
+            output += f"  操作方向: {weekly_trend['operation']}\n\n"
+            
+            output += "  均线状态:\n"
+            output += f"    MA5周:  {weekly_trend['ma5']}\n"
+            output += f"    MA20周: {weekly_trend['ma20']} (生命线)\n"
+            output += f"    MA60周: {weekly_trend['ma60']} (牛熊线)\n"
+            output += f"    价格vs MA20: {weekly_trend['price_vs_ma20']}%\n"
+            output += f"    价格vs MA60: {weekly_trend['price_vs_ma60']}%\n"
+            output += f"    MA20斜率: {weekly_trend['ma20_slope']}%\n\n"
+            
+            output += "  MACD状态:\n"
+            output += f"    DIF: {weekly_trend['macd_dif']}, DEA: {weekly_trend['macd_dea']}\n"
+            output += f"    位置: {weekly_trend['macd_position']}, 状态: {weekly_trend['macd_cross']}\n"
+            if weekly_trend['divergence']['type'] != 'none':
+                output += f"    ⚠️ {weekly_trend['divergence']['type']}: {weekly_trend['divergence']['description']}\n"
+            output += "\n"
+            
+            output += "  趋势信号:\n"
+            for sig in weekly_trend['signals']:
+                output += f"    • {sig}\n"
+            output += "\n"
+            
+            # 支撑阻力位
+            output += "【关键价位】\n"
+            output += "-" * 40 + "\n"
+            output += f"  最近支撑位: {sr_levels['nearest_support']:.4f}\n"
+            output += f"  最近阻力位: {sr_levels['nearest_resistance']:.4f}\n"
+            output += f"  周期最高: {sr_levels['period_high']}\n"
+            output += f"  周期最低: {sr_levels['period_low']}\n"
+            output += f"  周线MA20: {sr_levels['ma20']}\n"
+            output += f"  周线MA60: {sr_levels['ma60']}\n\n"
+            
+            # 日线买入信号
+            output += "【第二步：日线买入信号】\n"
+            output += "-" * 40 + "\n"
+            output += f"  信号强度: {buy_signals['signal_strength']}分 (70分以上为强信号)\n"
+            output += f"  建议: {buy_signals['recommendation']}\n\n"
+            
+            if buy_signals['signals']:
+                output += "  检测到的买入信号:\n"
+                for sig in buy_signals['signals']:
+                    output += f"    ✓ {sig}\n"
+            else:
+                output += "  暂无明显买入信号\n"
+            output += "\n"
+            
+            output += "  日线指标:\n"
+            ind = buy_signals['indicators']
+            output += f"    KDJ: K={ind['kdj_k']}, D={ind['kdj_d']}, J={ind['kdj_j']}\n"
+            output += f"    RSI(14): {ind['rsi_14']}\n"
+            output += f"    MACD: DIF={ind['macd_dif']}, DEA={ind['macd_dea']}\n"
+            output += f"    BOLL%%B: {ind['percent_b']}%\n"
+            output += f"    量比: {ind['volume_ratio']}\n\n"
+            
+            # 日线卖出信号
+            output += "【日线卖出/止盈信号】\n"
+            output += "-" * 40 + "\n"
+            output += f"  信号强度: {sell_signals['signal_strength']}分\n"
+            output += f"  建议: {sell_signals['recommendation']}\n\n"
+            
+            if sell_signals['signals']:
+                output += "  检测到的卖出信号:\n"
+                for sig in sell_signals['signals']:
+                    output += f"    ✗ {sig}\n"
+            output += "\n"
+            
+            # 综合操作建议
+            output += "=" * 60 + "\n"
+            output += "【综合操作建议】\n"
+            output += "=" * 60 + "\n"
+            
+            trend_strength = weekly_trend['trend_strength']
+            buy_strength = buy_signals['signal_strength']
+            sell_strength = sell_signals['signal_strength']
+            
+            if trend_strength >= 60:
+                # 强势多头趋势
+                if buy_strength >= 70:
+                    output += "  ★★★ 强烈买入机会 ★★★\n"
+                    output += "  周线强势多头 + 日线强买入信号\n"
+                    output += f"  建议: 分批建仓，首次40%仓位\n"
+                    output += f"  止损位: {latest_price * 0.96:.4f} (-4%)\n"
+                    output += f"  目标位: {sr_levels['nearest_resistance']:.4f}\n"
+                elif buy_strength >= 50:
+                    output += "  ★★ 较好买入机会 ★★\n"
+                    output += "  周线多头趋势 + 日线有买入信号\n"
+                    output += f"  建议: 轻仓试探，20%仓位\n"
+                    output += f"  止损位: {latest_price * 0.96:.4f} (-4%)\n"
+                else:
+                    output += "  ★ 趋势向好，等待回调 ★\n"
+                    output += "  周线多头趋势，但日线买入信号不足\n"
+                    output += f"  建议: 等待价格回调至{weekly_trend['ma20']:.4f}附近\n"
+            
+            elif trend_strength >= 30:
+                # 偏多震荡
+                if buy_strength >= 60:
+                    output += "  ★ 可考虑轻仓参与 ★\n"
+                    output += "  周线偏多震荡 + 日线有买入信号\n"
+                    output += f"  建议: 轻仓操作，不超过20%仓位\n"
+                    output += f"  止损位: {latest_price * 0.95:.4f} (-5%)\n"
+                else:
+                    output += "  观望等待\n"
+                    output += "  周线方向不够明确，日线信号不足\n"
+                    output += "  建议: 等待周线趋势明朗\n"
+            
+            elif trend_strength <= -60:
+                # 强势空头
+                output += "  ⚠️ 空仓观望 ⚠️\n"
+                output += "  周线空头趋势，不宜做多\n"
+                output += "  建议: 耐心等待止跌信号，不要接飞刀\n"
+                if weekly_trend['divergence']['type'] == '底背离':
+                    output += f"  关注: 周线出现底背离，可能接近底部\n"
+            
+            elif trend_strength <= -30:
+                # 偏空震荡
+                output += "  ⚠️ 谨慎观望 ⚠️\n"
+                output += "  周线偏空，不建议重仓\n"
+                output += "  建议: 减仓或观望，等待趋势反转\n"
+            
+            else:
+                # 震荡整理
+                output += "  横盘观望\n"
+                output += "  周线方向不明确，震荡整理中\n"
+                output += "  建议: 等待突破方向确认\n"
+                output += f"  上方阻力: {sr_levels['nearest_resistance']:.4f}\n"
+                output += f"  下方支撑: {sr_levels['nearest_support']:.4f}\n"
+            
+            output += "\n"
+            output += "【风险提示】\n"
+            output += "  • 任何买入必须设置止损（建议-4%~-5%）\n"
+            output += "  • 单只ETF仓位不超过总资金20%-30%\n"
+            output += "  • 以上分析仅供参考，不构成投资建议\n"
+            
+            return output
+            
+        except Exception as e:
+            return f"波段分析失败: {str(e)}"
+
+    @mcp.tool()
+    def get_weekly_trend(code: str) -> str:
+        """
+        获取ETF周线趋势分析
+        使用MA20（生命线）和MA60（牛熊分界线）判断中期趋势方向
+        
+        Args:
+            code: ETF代码，如"510300"、"159915"
+        
+        Returns:
+            周线趋势分析报告
+        """
+        try:
+            # 获取ETF名称
+            try:
+                etf_info = get_cached_etf_spot()
+                name_row = etf_info[etf_info['代码'] == code]
+                etf_name = name_row['名称'].values[0] if not name_row.empty else code
+            except:
+                etf_name = code
+            
+            # 获取数据
+            daily_df = get_etf_hist_data(code, days=500)
+            if daily_df.empty:
+                return f"未能获取ETF {code} 的数据"
+            
+            weekly_df = resample_to_weekly(daily_df)
+            if len(weekly_df) < 60:
+                return f"周线数据不足60周，无法进行完整趋势分析"
+            
+            latest_price = daily_df['close'].iloc[-1]
+            
+            # 分析趋势
+            trend = analyze_weekly_trend(weekly_df)
+            
+            if 'error' in trend:
+                return trend['error']
+            
+            # 生成报告
+            output = f"=== {etf_name}({code}) 周线趋势分析 ===\n\n"
+            output += f"当前价格: {latest_price:.4f}\n\n"
+            
+            output += "【趋势判断】\n"
+            output += f"  类型: {trend['trend_type']}\n"
+            output += f"  强度: {trend['trend_strength']}分\n"
+            output += f"  操作建议: {trend['operation']}\n\n"
+            
+            output += "【均线系统】\n"
+            output += f"  MA5周:  {trend['ma5']}\n"
+            output += f"  MA20周: {trend['ma20']} (生命线)\n"
+            output += f"  MA60周: {trend['ma60']} (牛熊线)\n"
+            output += f"  价格偏离MA20: {trend['price_vs_ma20']}%\n"
+            output += f"  价格偏离MA60: {trend['price_vs_ma60']}%\n"
+            output += f"  MA20斜率: {trend['ma20_slope']}% (正=向上)\n"
+            output += f"  MA60斜率: {trend['ma60_slope']}%\n\n"
+            
+            output += "【MACD状态】\n"
+            output += f"  DIF: {trend['macd_dif']}\n"
+            output += f"  DEA: {trend['macd_dea']}\n"
+            output += f"  位置: {trend['macd_position']}\n"
+            output += f"  状态: {trend['macd_cross']}\n"
+            
+            if trend['divergence']['type'] != 'none':
+                output += f"  ⚠️ 背离: {trend['divergence']['type']} - {trend['divergence']['description']}\n"
+            output += "\n"
+            
+            output += "【趋势信号】\n"
+            for sig in trend['signals']:
+                output += f"  • {sig}\n"
+            
+            return output
+            
+        except Exception as e:
+            return f"周线趋势分析失败: {str(e)}"
+
+    @mcp.tool()
+    def get_daily_buy_signal(code: str, support_price: float = 0) -> str:
+        """
+        获取日线买入信号分析
+        在周线多头趋势下，寻找日线级别的回调买入机会
+        
+        检测信号包括：
+        - MACD底背离
+        - KDJ超卖区金叉
+        - RSI超卖
+        - 价格回调至关键支撑位
+        - 成交量萎缩（卖盘枯竭）
+        - 看涨K线形态
+        
+        Args:
+            code: ETF代码
+            support_price: 关键支撑位价格（可选）
+        
+        Returns:
+            日线买入信号分析报告
+        """
+        try:
+            # 获取ETF名称
+            try:
+                etf_info = get_cached_etf_spot()
+                name_row = etf_info[etf_info['代码'] == code]
+                etf_name = name_row['名称'].values[0] if not name_row.empty else code
+            except:
+                etf_name = code
+            
+            # 获取数据
+            daily_df = get_etf_hist_data(code, days=120)
+            if daily_df.empty or len(daily_df) < 60:
+                return f"数据不足，无法分析"
+            
+            latest_price = daily_df['close'].iloc[-1]
+            
+            # 分析买入信号
+            signals = analyze_daily_buy_signals(
+                daily_df,
+                weekly_support=support_price if support_price > 0 else None
+            )
+            
+            if 'error' in signals:
+                return signals['error']
+            
+            # 生成报告
+            output = f"=== {etf_name}({code}) 日线买入信号 ===\n\n"
+            output += f"当前价格: {latest_price:.4f}\n\n"
+            
+            output += "【信号强度】\n"
+            output += f"  综合评分: {signals['signal_strength']}分 (满分100)\n"
+            output += f"  建议: {signals['recommendation']}\n\n"
+            
+            output += "【检测到的买入信号】\n"
+            if signals['signals']:
+                for sig in signals['signals']:
+                    output += f"  ✓ {sig}\n"
+            else:
+                output += "  暂无明显买入信号\n"
+            output += "\n"
+            
+            output += "【关键指标】\n"
+            ind = signals['indicators']
+            output += f"  KDJ: K={ind['kdj_k']}, D={ind['kdj_d']}, J={ind['kdj_j']}\n"
+            if ind['kdj_j'] < 20:
+                output += "       ↳ J值<20，处于超卖区\n"
+            output += f"  RSI(14): {ind['rsi_14']}\n"
+            if ind['rsi_14'] < 30:
+                output += "       ↳ RSI<30，超卖\n"
+            output += f"  MACD: DIF={ind['macd_dif']}, DEA={ind['macd_dea']}\n"
+            output += f"  BOLL%%B: {ind['percent_b']}%\n"
+            if ind['percent_b'] < 20:
+                output += "       ↳ 接近布林带下轨\n"
+            output += f"  量比: {ind['volume_ratio']}\n"
+            if ind['volume_ratio'] < 0.7:
+                output += "       ↳ 成交量萎缩，卖盘枯竭\n"
+            output += "\n"
+            
+            output += "【均线参考】\n"
+            output += f"  MA5:  {ind['ma5']}\n"
+            output += f"  MA10: {ind['ma10']}\n"
+            output += f"  MA20: {ind['ma20']}\n"
+            output += f"  MA60: {ind['ma60']}\n"
+            output += f"  EMA50: {ind['ema50']}\n"
+            
+            if signals['divergence']['type'] == '底背离':
+                output += f"\n⚠️ 重要: 检测到MACD{signals['divergence']['type']}\n"
+                output += f"   {signals['divergence']['description']}\n"
+            
+            return output
+            
+        except Exception as e:
+            return f"买入信号分析失败: {str(e)}"
+
+    @mcp.tool()
+    def get_daily_sell_signal(code: str, entry_price: float = 0, resistance_price: float = 0) -> str:
+        """
+        获取日线卖出/止盈信号分析
+        
+        检测信号包括：
+        - MACD顶背离
+        - KDJ超买区死叉
+        - RSI超买
+        - 价格接近阻力位
+        - 跌破短期均线
+        
+        Args:
+            code: ETF代码
+            entry_price: 买入价格（用于计算止盈止损，可选）
+            resistance_price: 阻力位价格（可选）
+        
+        Returns:
+            日线卖出信号分析报告
+        """
+        try:
+            # 获取ETF名称
+            try:
+                etf_info = get_cached_etf_spot()
+                name_row = etf_info[etf_info['代码'] == code]
+                etf_name = name_row['名称'].values[0] if not name_row.empty else code
+            except:
+                etf_name = code
+            
+            # 获取数据
+            daily_df = get_etf_hist_data(code, days=120)
+            if daily_df.empty or len(daily_df) < 30:
+                return f"数据不足，无法分析"
+            
+            latest_price = daily_df['close'].iloc[-1]
+            
+            # 分析卖出信号
+            signals = analyze_daily_sell_signals(
+                daily_df,
+                entry_price=entry_price if entry_price > 0 else None,
+                weekly_resistance=resistance_price if resistance_price > 0 else None
+            )
+            
+            if 'error' in signals:
+                return signals['error']
+            
+            # 生成报告
+            output = f"=== {etf_name}({code}) 日线卖出信号 ===\n\n"
+            output += f"当前价格: {latest_price:.4f}\n"
+            
+            if entry_price > 0:
+                profit_pct = (latest_price - entry_price) / entry_price * 100
+                output += f"买入价格: {entry_price:.4f}\n"
+                output += f"当前盈亏: {profit_pct:.2f}%\n"
+            output += "\n"
+            
+            output += "【信号强度】\n"
+            output += f"  综合评分: {signals['signal_strength']}分\n"
+            output += f"  建议: {signals['recommendation']}\n\n"
+            
+            output += "【检测到的卖出信号】\n"
+            if signals['signals']:
+                for sig in signals['signals']:
+                    output += f"  ✗ {sig}\n"
+            else:
+                output += "  暂无明显卖出信号\n"
+            output += "\n"
+            
+            if signals['stop_loss'] or signals['take_profit']:
+                output += "【止盈止损建议】\n"
+                if signals['stop_loss']:
+                    output += f"  止损位: {signals['stop_loss']:.4f}\n"
+                if signals['take_profit']:
+                    output += f"  移动止盈位: {signals['take_profit']:.4f}\n"
+                output += "\n"
+            
+            output += "【关键指标】\n"
+            ind = signals['indicators']
+            output += f"  KDJ: K={ind['kdj_k']}, D={ind['kdj_d']}, J={ind['kdj_j']}\n"
+            if ind['kdj_j'] > 80:
+                output += "       ↳ J值>80，处于超买区\n"
+            output += f"  RSI(14): {ind['rsi_14']}\n"
+            if ind['rsi_14'] > 70:
+                output += "       ↳ RSI>70，超买\n"
+            output += f"  MACD: DIF={ind['macd_dif']}, DEA={ind['macd_dea']}\n"
+            output += f"  BOLL%%B: {ind['percent_b']}%\n"
+            if ind['percent_b'] > 80:
+                output += "       ↳ 接近布林带上轨\n"
+            
+            if signals['divergence']['type'] == '顶背离':
+                output += f"\n⚠️ 重要: 检测到MACD{signals['divergence']['type']}\n"
+                output += f"   {signals['divergence']['description']}\n"
+            
+            return output
+            
+        except Exception as e:
+            return f"卖出信号分析失败: {str(e)}"
+
+    @mcp.tool()
+    def get_support_resistance(code: str, weeks: int = 52) -> str:
+        """
+        获取ETF的关键支撑阻力位
+        
+        Args:
+            code: ETF代码
+            weeks: 分析周期（周数），默认52周
+        
+        Returns:
+            支撑阻力位分析报告
+        """
+        try:
+            # 获取ETF名称
+            try:
+                etf_info = get_cached_etf_spot()
+                name_row = etf_info[etf_info['代码'] == code]
+                etf_name = name_row['名称'].values[0] if not name_row.empty else code
+            except:
+                etf_name = code
+            
+            # 获取数据
+            daily_df = get_etf_hist_data(code, days=weeks * 7)
+            if daily_df.empty:
+                return f"未能获取ETF {code} 的数据"
+            
+            weekly_df = resample_to_weekly(daily_df)
+            latest_price = daily_df['close'].iloc[-1]
+            
+            # 分析支撑阻力
+            sr = find_support_resistance(weekly_df, weeks)
+            
+            # 生成报告
+            output = f"=== {etf_name}({code}) 支撑阻力位分析 ===\n\n"
+            output += f"当前价格: {latest_price:.4f}\n"
+            output += f"分析周期: 近{weeks}周\n\n"
+            
+            output += "【关键价位】\n"
+            output += f"  周期最高: {sr['period_high']}\n"
+            output += f"  周期最低: {sr['period_low']}\n\n"
+            
+            output += "【阻力位】(由近到远)\n"
+            for i, r in enumerate(sr['resistances'][:3], 1):
+                distance = (r - latest_price) / latest_price * 100
+                output += f"  {i}. {r:.4f} (距当前+{distance:.1f}%)\n"
+            output += "\n"
+            
+            output += "【支撑位】(由近到远)\n"
+            for i, s in enumerate(sr['supports'][:3], 1):
+                distance = (latest_price - s) / latest_price * 100
+                output += f"  {i}. {s:.4f} (距当前-{distance:.1f}%)\n"
+            output += "\n"
+            
+            output += "【均线支撑阻力】\n"
+            ma20_pos = "支撑" if latest_price > sr['ma20'] else "阻力"
+            ma60_pos = "支撑" if latest_price > sr['ma60'] else "阻力"
+            output += f"  周线MA20: {sr['ma20']} ({ma20_pos})\n"
+            output += f"  周线MA60: {sr['ma60']} ({ma60_pos})\n"
+            
+            return output
+            
+        except Exception as e:
+            return f"支撑阻力分析失败: {str(e)}"
+
+    @mcp.tool()
+    def screen_swing_opportunities(category: str = "index") -> str:
+        """
+        筛选波段交易机会
+        扫描符合"周线多头+日线回调"条件的ETF
+        
+        Args:
+            category: ETF类别
+                - "index": 宽基指数ETF（沪深300、创业板等）
+                - "industry": 行业ETF
+                - "cross_border": 跨境ETF
+        
+        Returns:
+            符合条件的ETF列表及其信号强度
+        """
+        try:
+            # 定义筛选标的
+            targets = {
+                "index": ["沪深300", "创业板", "科创50", "中证500", "上证50"],
+                "industry": ["医药", "消费", "新能源", "半导体", "军工", "银行"],
+                "cross_border": ["纳斯达克", "标普500", "恒生科技", "恒生"]
+            }
+            
+            etf_names = targets.get(category, targets["index"])
+            
+            output = f"=== 波段交易机会筛选 ({category}) ===\n"
+            output += f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            output += f"筛选条件: 周线多头趋势 + 日线有买入信号\n\n"
+            
+            opportunities = []
+            
+            for name in etf_names:
+                try:
+                    etf_list = search_etf_by_name(name)
+                    if not etf_list or 'error' in etf_list[0]:
+                        continue
+                    
+                    etf = etf_list[0]
+                    code = etf['code']
+                    
+                    # 获取数据
+                    daily_df = get_etf_hist_data(code, days=400)
+                    if len(daily_df) < 120:
+                        continue
+                    
+                    weekly_df = resample_to_weekly(daily_df)
+                    if len(weekly_df) < 60:
+                        continue
+                    
+                    # 分析周线趋势
+                    trend = analyze_weekly_trend(weekly_df)
+                    if 'error' in trend:
+                        continue
+                    
+                    # 只关注多头或偏多趋势
+                    if trend['trend_strength'] < 30:
+                        continue
+                    
+                    # 分析日线买入信号
+                    buy_signals = analyze_daily_buy_signals(daily_df, weekly_ma20=trend['ma20'])
+                    
+                    # 记录机会
+                    opportunities.append({
+                        'name': etf['name'],
+                        'code': code,
+                        'price': daily_df['close'].iloc[-1],
+                        'trend_type': trend['trend_type'],
+                        'trend_strength': trend['trend_strength'],
+                        'buy_strength': buy_signals['signal_strength'],
+                        'signals': buy_signals['signals'][:3]  # 只取前3个信号
+                    })
+                    
+                except Exception:
+                    continue
+            
+            # 按综合评分排序
+            opportunities.sort(key=lambda x: x['trend_strength'] + x['buy_strength'], reverse=True)
+            
+            if not opportunities:
+                output += "暂无符合条件的ETF\n"
+                output += "（需要周线趋势强度>=30分）\n"
+                return output
+            
+            output += f"找到 {len(opportunities)} 个机会:\n\n"
+            
+            for i, opp in enumerate(opportunities, 1):
+                total_score = opp['trend_strength'] + opp['buy_strength']
+                output += f"{i}. {opp['name']}({opp['code']})\n"
+                output += f"   价格: {opp['price']:.4f}\n"
+                output += f"   周线趋势: {opp['trend_type']} ({opp['trend_strength']}分)\n"
+                output += f"   日线买入信号: {opp['buy_strength']}分\n"
+                output += f"   综合评分: {total_score}分\n"
+                
+                if opp['signals']:
+                    output += "   信号:\n"
+                    for sig in opp['signals']:
+                        output += f"     • {sig}\n"
+                output += "\n"
+            
+            output += "【说明】\n"
+            output += "  • 综合评分 = 周线趋势分 + 日线买入信号分\n"
+            output += "  • 评分越高，机会越好\n"
+            output += "  • 建议优先关注综合评分>100的标的\n"
+            
+            return output
+            
+        except Exception as e:
+            return f"筛选失败: {str(e)}"
